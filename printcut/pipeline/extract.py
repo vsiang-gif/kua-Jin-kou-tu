@@ -15,6 +15,34 @@ from ..config import Options
 
 DETECT_LONG_SIDE = 1600
 SPECK_AREA = [0.0, 0.00002, 0.00008, 0.0003]
+# Contrast (multiple of the threshold) above which a blob is surely ink, never noise/shading.
+STRONG_INK = 2.5
+# Separate design parts closer than this (fraction of the shirt size) belong to one print.
+GROUP_GAP = 0.08
+
+
+def _gather_print(merged_labels: np.ndarray, stats: np.ndarray, sums: np.ndarray, best: int,
+                  gap: float) -> np.ndarray:
+    """Start from the main blob and add every nearby blob (text lines, fuses, dots)."""
+    n = stats.shape[0]
+    x0, y0 = stats[best, 0], stats[best, 1]
+    x1, y1 = x0 + stats[best, 2], y0 + stats[best, 3]
+    chosen = {best}
+    changed = True
+    while changed:
+        changed = False
+        for i in range(1, n):
+            if i in chosen or sums[i] <= 0:
+                continue
+            bx0, by0 = stats[i, 0], stats[i, 1]
+            bx1, by1 = bx0 + stats[i, 2], by0 + stats[i, 3]
+            dx = max(0, bx0 - x1, x0 - bx1)
+            dy = max(0, by0 - y1, y0 - by1)
+            if max(dx, dy) <= gap:
+                chosen.add(i)
+                x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
+                changed = True
+    return np.isin(merged_labels, list(chosen)).astype(np.uint8)
 
 
 @dataclass
@@ -72,19 +100,98 @@ def _illumination(lab: np.ndarray, fabric_px: np.ndarray, fabric_l: float, size:
     return np.where(d2 > 1e-3, illum, fabric_l).astype(np.float32)
 
 
-def _remove_small(binary: np.ndarray, min_area: float) -> tuple[np.ndarray, int]:
+def _fill_holes(binary: np.ndarray) -> np.ndarray:
+    """Binary mask plus every region it fully encloses."""
+    inv = (~binary.astype(bool)).astype(np.uint8)
+    n, labels = cv2.connectedComponents(inv, connectivity=4)
+    edge = np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
+    outside = np.isin(labels, np.unique(edge[edge > 0]))
+    return ~outside
+
+
+def _shirt_region(small: np.ndarray, fg_s: np.ndarray) -> tuple[np.ndarray, str]:
+    """Shirt mask from BiRefNet, repaired when the AI only grabbed part of the shirt.
+
+    On dark shirts with glowing artwork BiRefNet sometimes treats one bright design
+    element as the subject. Product photos usually have a plain studio background,
+    so "everything not connected to the background colour" is a reliable shirt mask
+    and is used whenever it clearly contains a larger shirt than the AI mask.
+    """
+    h, w = small.shape[:2]
+    region = _fill_holes(fg_s > 0.5)
+    lab = _lab(small)
+    bw = max(2, min(h, w) // 100)
+    border = np.concatenate([
+        lab[:bw].reshape(-1, 3), lab[-bw:].reshape(-1, 3),
+        lab[:, :bw].reshape(-1, 3), lab[:, -bw:].reshape(-1, 3),
+    ])
+    bg = np.median(border, axis=0)
+    if float((np.linalg.norm(border - bg, axis=1) < 12).mean()) < 0.85:
+        return region, ""
+
+    close = (np.linalg.norm(lab - bg, axis=2) < 14).astype(np.uint8)
+    n, labels = cv2.connectedComponents(close, connectivity=8)
+    edge = np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
+    background = np.isin(labels, np.unique(edge[edge > 0]))
+    shirt = cv2.morphologyEx((~background).astype(np.uint8), cv2.MORPH_OPEN, _ellipse(max(2, min(h, w) // 200)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(shirt, connectivity=8)
+    if n <= 1:
+        return region, ""
+    shirt = _fill_holes(labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])))
+
+    s_area, r_area = float(shirt.sum()), float(region.sum())
+    if not 0.1 <= s_area / (h * w) <= 0.92:
+        return region, ""
+    covered = float((region & shirt).sum()) / max(r_area, 1.0)
+    if r_area < 0.6 * s_area and covered > 0.9:
+        return shirt, "AI 只识别到部分衣服，已改用背景色识别整件衣服"
+    return region, ""
+
+
+def _component_peaks(labels: np.ndarray, n: int, d: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    peak = np.zeros(n, np.float32)
+    np.maximum.at(peak, labels[mask], d[mask])
+    return peak
+
+
+def _remove_small(
+    binary: np.ndarray,
+    min_area: float,
+    d: np.ndarray | None = None,
+    strong: float = 0.0,
+    group_radius: int = 0,
+) -> tuple[np.ndarray, int]:
+    """Drop tiny blobs.
+
+    Kept anyway: tiny blobs with strong ink contrast (design dots), and tiny blobs
+    lying close together whose combined area is large (thin strokes broken into
+    fragments, e.g. hand-drawn flames or fine lettering). Real noise is scattered.
+    """
+    binary = binary.astype(bool)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary.astype(np.uint8), connectivity=8)
     if n <= 1:
-        return binary.astype(bool), 0
-    keep = stats[:, cv2.CC_STAT_AREA] >= max(1.0, min_area)
+        return binary, 0
+    area = stats[:, cv2.CC_STAT_AREA]
+    keep = area >= max(1.0, min_area)
+    if group_radius > 0:
+        grouped = cv2.dilate(binary.astype(np.uint8), _ellipse(group_radius))
+        gn, glabels = cv2.connectedComponents(grouped, connectivity=8)
+        group_area = np.bincount(glabels[binary], minlength=gn)
+        member_group = np.zeros(n, np.int64)
+        member_group[labels[binary]] = glabels[binary]
+        keep |= group_area[member_group] >= max(1.0, min_area) * 4
+    if d is not None and strong > 0:
+        keep |= (_component_peaks(labels, n, d, binary) >= strong) & (area >= 3)
     keep[0] = False
     return keep[labels], int(keep.sum())
 
 
-def _drop_shading(binary: np.ndarray, lab: np.ndarray, d: np.ndarray, fabric: np.ndarray) -> np.ndarray:
-    """Remove blobs that look like fold shadows: colourless with soft edges.
+def _drop_shading(binary: np.ndarray, lab: np.ndarray, d: np.ndarray, fabric: np.ndarray, t: float) -> np.ndarray:
+    """Remove blobs that look like fold shadows: colourless, soft-edged and weak.
 
-    Ink has crisp edges relative to its contrast; shading fades out gradually.
+    Ink has crisp edges relative to its contrast; shading fades out gradually and
+    never gets as far from the fabric colour as real ink (black ink is also
+    colourless, so strong contrast alone marks a blob as ink).
     """
     b = binary.astype(np.uint8)
     n, labels = cv2.connectedComponents(b, connectivity=8)
@@ -105,7 +212,8 @@ def _drop_shading(binary: np.ndarray, lab: np.ndarray, d: np.ndarray, fabric: np
     mean_g = np.bincount(e_lab, weights=grad[edge], minlength=n) / np.maximum(e_cnt, 1)
 
     sharpness = mean_g / np.maximum(mean_d, 1e-3)
-    shading = (mean_c < 10) & (sharpness < 3.0)
+    peak = _component_peaks(labels, n, d, binary)
+    shading = (mean_c < 10) & (sharpness < 3.0) & (peak < STRONG_INK * t)
     shading[0] = False
     return binary & ~shading[labels]
 
@@ -122,10 +230,11 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
     h, w = small.shape[:2]
     m = min(h, w)
 
-    region = (fg_s > 0.5).astype(np.uint8)
+    region_b, region_note = _shirt_region(small, fg_s)
+    region = region_b.astype(np.uint8)
     ratio = float(region.mean())
     ring_w = max(4, int(m * 0.03))
-    notes: list[str] = []
+    notes: list[str] = [region_note] if region_note else []
     if 0.03 <= ratio <= 0.85:
         mode = "shirt"
         inner = cv2.erode(region, _ellipse(max(3, int(m * 0.012))))
@@ -139,8 +248,8 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
     if ring.sum() < 50:
         ring = inner
 
-    # Heather/knit texture is very noisy; detect on a denoised copy.
-    k = max(3, (m // 150) | 1)
+    # Light denoise only: a large median would erase thin strokes (fine text, fuses, dots).
+    k = 3 if m < 1400 else 5
     lab = _lab(cv2.medianBlur(small, k))
     fabric = np.median(lab[ring > 0], axis=0).astype(np.float32)
     fabric_rgb = cv2.cvtColor(np.clip(fabric, 0, 255).astype(np.uint8)[None, None], cv2.COLOR_LAB2RGB)[0, 0]
@@ -164,9 +273,19 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
     level = int(np.clip(opts.despeckle, 0, 3))
     if level >= 2:
         binary = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_OPEN, _ellipse(level - 1)) > 0
-    binary, _ = _remove_small(binary, SPECK_AREA[level] * h * w)
+    group_r = max(2, m // 250)
+    binary, _ = _remove_small(binary, SPECK_AREA[level] * h * w, d, STRONG_INK * t, group_r)
     if opts.dewrinkle:
-        binary = _drop_shading(binary, lab, d, fabric)
+        binary = _drop_shading(binary, lab, d, fabric, t)
+    if mode == "shirt":
+        # Ink touching the shirt outline is arms, collar or seams, not the print.
+        # Drop it per piece, before merging, so it cannot drag nearby design parts away.
+        border = inner_b & (cv2.erode(inner, _ellipse(max(2, int(m * 0.01)))) == 0)
+        n_b, lab_b = cv2.connectedComponents(binary.astype(np.uint8), connectivity=8)
+        bad = np.zeros(n_b, bool)
+        bad[np.unique(lab_b[border & binary])] = True
+        bad[0] = False
+        binary = binary & ~bad[lab_b]
     if binary.sum() < h * w * 0.002:
         return Extraction(found=False, mode=mode, notes=["没有找到明显的印花（可能和衣服颜色太接近）"])
 
@@ -178,7 +297,7 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
     centre = np.array([xs.mean(), ys.mean()]) if xs.size else np.array([w / 2, h / 2])
     dist = np.linalg.norm(cents - centre, axis=1) / max(m, 1)
     best = int(np.argmax(sums * (1.0 - 0.5 * np.clip(dist, 0, 1))))
-    blob = (labels == best).astype(np.uint8)
+    blob = _gather_print(labels, stats, sums, best, GROUP_GAP * m)
 
     x, y, bw, bh = cv2.boundingRect(blob)
     pad = int(m * 0.01)
@@ -201,7 +320,23 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
     d_c = _distance(lab_c, fabric, illum_c, l_weight)
     alpha = np.clip((d_c - 0.75 * t) / (0.5 * t), 0, 1).astype(np.float32) * blob_full
 
-    hard, components = _remove_small(alpha > 0.5, SPECK_AREA[level] * h * w * inv * inv)
+    hard, components = _remove_small(alpha > 0.5, SPECK_AREA[level] * h * w * inv * inv, d_c, STRONG_INK * t,
+                                      max(2, int(group_r * inv)))
+    # Enclosed gaps that are clearly not fabric (dark shades of a planet on a black
+    # shirt, shadows inside artwork) belong to the print. Letter counters and the
+    # inside of outlined shapes match the fabric colour and stay transparent.
+    holes = (_fill_holes(hard) & ~hard).astype(np.uint8)
+    hn, hlabels, hstats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
+    if hn > 1:
+        harea = hstats[:, cv2.CC_STAT_AREA].astype(np.float64)
+        hmean = np.bincount(hlabels.ravel(), weights=d_c.ravel(), minlength=hn) / np.maximum(harea, 1)
+        fill = (hmean > 0.35 * t) & (harea < 0.15 * ch * cw)
+        fill[0] = False
+        if fill.any():
+            weak = np.clip((d_c - 0.25 * t) / (0.5 * t), 0, 1).astype(np.float32)
+            alpha = np.where(fill[hlabels], np.maximum(alpha, weak), alpha)
+            hard = hard | (fill[hlabels] & (weak > 0.5))
+
     soft_zone = cv2.dilate(hard.astype(np.uint8), _ellipse(2)) > 0
     alpha = np.where(soft_zone, alpha, 0).astype(np.float32)
 
@@ -289,6 +424,12 @@ def straighten(rgb: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, np.ndarr
 
 def classify(rgb: np.ndarray, alpha: np.ndarray) -> str:
     """'graphic' when ~8 flat colours explain the print well, otherwise 'photo'."""
+    visible = alpha > 0.1
+    if visible.sum() >= 200:
+        # Glows and soft gradients fade into the fabric; flat colours would turn them into blotches.
+        soft = float((visible & (alpha < 0.9)).sum()) / float(visible.sum())
+        if soft > 0.3:
+            return "photo"
     px = _lab(rgb)[alpha > 0.9]
     if px.shape[0] < 200:
         return "graphic"
