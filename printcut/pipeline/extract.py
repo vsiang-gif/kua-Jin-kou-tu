@@ -150,6 +150,29 @@ def _shirt_region(small: np.ndarray, fg_s: np.ndarray) -> tuple[np.ndarray, str]
     return region, ""
 
 
+def _fabric_shirt(lab: np.ndarray, fabric: np.ndarray, region: np.ndarray, m: int) -> np.ndarray | None:
+    """Shirt = the fabric-coloured area plus everything it encloses.
+
+    On model photos BiRefNet returns the whole person, so arms, hands and the neck
+    sit inside the "shirt" mask. They are not surrounded by fabric, while the print is,
+    so filling the holes of the fabric area keeps the print and drops the body.
+    """
+    dl = lab[..., 0] - fabric[0]
+    close = (np.sqrt(0.25 * dl ** 2 + (lab[..., 1] - fabric[1]) ** 2 + (lab[..., 2] - fabric[2]) ** 2) < 22) & region
+    close = cv2.morphologyEx(close.astype(np.uint8), cv2.MORPH_OPEN, _ellipse(max(1, m // 300)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(close, connectivity=8)
+    if n <= 1:
+        return None
+    main = (labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    # Bridge thin print lines that cut the fabric, then take the enclosed area.
+    main = cv2.morphologyEx(main, cv2.MORPH_CLOSE, _ellipse(max(2, m // 150)))
+    shirt = _fill_holes(main) & region
+    r_area, s_area = float(region.sum()), float(shirt.sum())
+    if s_area < 0.35 * r_area or s_area > 0.95 * r_area:
+        return None
+    return shirt
+
+
 def _detect_scale(rgb: np.ndarray, fg: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
     H, W = rgb.shape[:2]
     scale = min(1.0, DETECT_LONG_SIDE / max(H, W))
@@ -272,6 +295,17 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options,
     k = 3 if m < 1400 else 5
     lab = _lab(cv2.medianBlur(small, k))
     fabric = np.median(lab[ring > 0], axis=0).astype(np.float32)
+    if mode == "shirt":
+        refined = _fabric_shirt(lab, fabric, region_b, m)
+        if refined is not None:
+            region = refined.astype(np.uint8)
+            inner = cv2.erode(region, _ellipse(max(3, int(m * 0.012))))
+            ring = inner & (1 - cv2.erode(inner, _ellipse(ring_w)))
+            inner_b = inner > 0
+            if ring.sum() < 50:
+                ring = inner
+            fabric = np.median(lab[ring > 0], axis=0).astype(np.float32)
+            notes.append("已排除手臂、皮肤等衣服以外的区域")
     fabric_rgb = cv2.cvtColor(np.clip(fabric, 0, 255).astype(np.uint8)[None, None], cv2.COLOR_LAB2RGB)[0, 0]
     l_weight = 0.55 if opts.dewrinkle else 1.0
 
@@ -297,20 +331,26 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options,
     binary, _ = _remove_small(binary, SPECK_AREA[level] * h * w, d, STRONG_INK * t, group_r)
     if opts.dewrinkle:
         binary = _drop_shading(binary, lab, d, fabric, t)
-    if mode == "shirt":
+    border = inner_b & (cv2.erode(inner, _ellipse(max(2, int(m * 0.01)))) == 0)
+
+    def drop_border_pieces(mask: np.ndarray) -> np.ndarray:
         # Ink touching the shirt outline is arms, collar or seams, not the print.
         # Drop it per piece, before merging, so it cannot drag nearby design parts away.
-        border = inner_b & (cv2.erode(inner, _ellipse(max(2, int(m * 0.01)))) == 0)
-        n_b, lab_b = cv2.connectedComponents(binary.astype(np.uint8), connectivity=8)
+        n_b, lab_b = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
         bad = np.zeros(n_b, bool)
-        bad[np.unique(lab_b[border & binary])] = True
+        bad[np.unique(lab_b[border & mask])] = True
         bad[0] = False
-        binary = binary & ~bad[lab_b]
+        return mask & ~bad[lab_b]
+
+    if mode == "shirt":
+        binary = drop_border_pieces(binary)
     hint_used = False
     if print_hint is not None:
         hint_s = print_hint if scale >= 1.0 else cv2.resize(print_hint.astype(np.float32), (w, h),
                                                             interpolation=cv2.INTER_LINEAR)
         hint_b = (hint_s > 0.5) & inner_b
+        if mode == "shirt":
+            hint_b = drop_border_pieces(hint_b)
         if h * w * 0.003 <= hint_b.sum() <= 0.8 * inner_b.sum():
             binary = binary | hint_b
             hint_used = True
