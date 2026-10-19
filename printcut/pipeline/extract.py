@@ -55,6 +55,7 @@ class Extraction:
     touches_edge: bool = False
     components: int = 0
     mode: str = "shirt"
+    ai_matte: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -126,7 +127,8 @@ def _shirt_region(small: np.ndarray, fg_s: np.ndarray) -> tuple[np.ndarray, str]
         lab[:, :bw].reshape(-1, 3), lab[:, -bw:].reshape(-1, 3),
     ])
     bg = np.median(border, axis=0)
-    if float((np.linalg.norm(border - bg, axis=1) < 12).mean()) < 0.85:
+    # Shirts often touch the photo edge, so only half the border needs to be studio background.
+    if float((np.linalg.norm(border - bg, axis=1) < 12).mean()) < 0.5:
         return region, ""
 
     close = (np.linalg.norm(lab - bg, axis=2) < 14).astype(np.uint8)
@@ -146,6 +148,26 @@ def _shirt_region(small: np.ndarray, fg_s: np.ndarray) -> tuple[np.ndarray, str]
     if r_area < 0.6 * s_area and covered > 0.9:
         return shirt, "AI 只识别到部分衣服，已改用背景色识别整件衣服"
     return region, ""
+
+
+def _detect_scale(rgb: np.ndarray, fg: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    H, W = rgb.shape[:2]
+    scale = min(1.0, DETECT_LONG_SIDE / max(H, W))
+    if scale >= 1.0:
+        return 1.0, rgb, fg
+    size = (max(1, round(W * scale)), max(1, round(H * scale)))
+    return (scale, cv2.resize(rgb, size, interpolation=cv2.INTER_AREA),
+            cv2.resize(fg, size, interpolation=cv2.INTER_LINEAR))
+
+
+def find_shirt(rgb: np.ndarray, fg: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Full-resolution shirt mask, and whether BiRefNet had only grabbed part of it
+    (in which case the AI mask itself is usually the artwork)."""
+    H, W = rgb.shape[:2]
+    _, small, fg_s = _detect_scale(rgb, fg)
+    region, note = _shirt_region(small, fg_s)
+    full = cv2.resize(region.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+    return full, bool(note)
 
 
 def _component_peaks(labels: np.ndarray, n: int, d: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -218,15 +240,13 @@ def _drop_shading(binary: np.ndarray, lab: np.ndarray, d: np.ndarray, fabric: np
     return binary & ~shading[labels]
 
 
-def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
+def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options,
+                  print_hint: np.ndarray | None = None) -> Extraction:
+    """print_hint: optional full-resolution 0..1 mask of the artwork from a second AI
+    pass. Photo prints (paintings, portraits) have dark areas as dark as the shirt,
+    which colour difference alone cannot separate; the AI mask fills those in."""
     H, W = rgb.shape[:2]
-    scale = min(1.0, DETECT_LONG_SIDE / max(H, W))
-    if scale < 1.0:
-        size = (max(1, round(W * scale)), max(1, round(H * scale)))
-        small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
-        fg_s = cv2.resize(fg, size, interpolation=cv2.INTER_LINEAR)
-    else:
-        small, fg_s = rgb, fg
+    scale, small, fg_s = _detect_scale(rgb, fg)
     h, w = small.shape[:2]
     m = min(h, w)
 
@@ -286,6 +306,15 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
         bad[np.unique(lab_b[border & binary])] = True
         bad[0] = False
         binary = binary & ~bad[lab_b]
+    hint_used = False
+    if print_hint is not None:
+        hint_s = print_hint if scale >= 1.0 else cv2.resize(print_hint.astype(np.float32), (w, h),
+                                                            interpolation=cv2.INTER_LINEAR)
+        hint_b = (hint_s > 0.5) & inner_b
+        if h * w * 0.003 <= hint_b.sum() <= 0.8 * inner_b.sum():
+            binary = binary | hint_b
+            hint_used = True
+            notes.append("AI 识别出印花主体")
     if binary.sum() < h * w * 0.002:
         return Extraction(found=False, mode=mode, notes=["没有找到明显的印花（可能和衣服颜色太接近）"])
 
@@ -319,6 +348,10 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
         illum_c = cv2.resize(illum[y0:y1, x0:x1], (cw, ch), interpolation=cv2.INTER_LINEAR)
     d_c = _distance(lab_c, fabric, illum_c, l_weight)
     alpha = np.clip((d_c - 0.75 * t) / (0.5 * t), 0, 1).astype(np.float32) * blob_full
+    hint_c = None
+    if hint_used:
+        hint_c = np.clip(print_hint[Y0:Y1, X0:X1].astype(np.float32), 0, 1)
+        alpha = np.maximum(alpha, hint_c * blob_full)
 
     hard, components = _remove_small(alpha > 0.5, SPECK_AREA[level] * h * w * inv * inv, d_c, STRONG_INK * t,
                                       max(2, int(group_r * inv)))
@@ -341,9 +374,16 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
     alpha = np.where(soft_zone, alpha, 0).astype(np.float32)
 
     contrast = float(np.median(d_c[hard]) / t) if hard.any() else 0.0
+    if hint_used:
+        # The AI matte separates the artwork even where its colours match the shirt.
+        contrast = max(contrast, 2.0)
 
     if illum_c is not None:
-        lab_c[..., 0] = np.clip(lab_c[..., 0] - 0.7 * (illum_c - fabric[0]), 0, 255)
+        corr = 0.7 * (illum_c - fabric[0])
+        if hint_c is not None:
+            # Wrinkle shading is estimated from fabric; inside the artwork it would distort the picture.
+            corr = corr * (1.0 - hint_c)
+        lab_c[..., 0] = np.clip(lab_c[..., 0] - corr, 0, 255)
     rgb_c = cv2.cvtColor(lab_c.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
 
     # Remove fabric colour bleeding into semi-transparent edge pixels.
@@ -369,6 +409,7 @@ def isolate_print(rgb: np.ndarray, fg: np.ndarray, opts: Options) -> Extraction:
         touches_edge=touches,
         components=components,
         mode=mode,
+        ai_matte=hint_used,
         notes=notes,
     )
 
