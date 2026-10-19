@@ -79,6 +79,7 @@ class Segmenter:
             attempts.append(["CPUExecutionProvider"])
 
             last_error: Exception | None = None
+            session = None
             for providers in attempts:
                 try:
                     opts = ort.SessionOptions()
@@ -87,18 +88,24 @@ class Segmenter:
                         opts.enable_mem_pattern = False
                         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                     session = ort.InferenceSession(str(path), sess_options=opts, providers=providers)
-                    active = session.get_providers()[0]
-                    self._session = session
-                    self._input_name = session.get_inputs()[0].name
-                    self.device = {
-                        "DmlExecutionProvider": "显卡加速（DirectML）",
-                        "CUDAExecutionProvider": "显卡加速（CUDA）",
-                    }.get(active, "CPU（较慢）")
-                    log(f"AI 模型已加载：{self.device}")
-                    return
+                    break
                 except Exception as exc:  # provider failed, try the next one
                     last_error = exc
-            raise RuntimeError(f"AI 模型加载失败：{last_error}")
+            if session is None:
+                raise RuntimeError(f"AI 模型加载失败：{last_error}")
+
+            active = session.get_providers()[0]
+            self._session = session
+            self._input_name = session.get_inputs()[0].name
+            self.device = {
+                "DmlExecutionProvider": "显卡加速（DirectML）",
+                "CUDAExecutionProvider": "显卡加速（CUDA）",
+            }.get(active, "CPU（较慢）")
+        # Logging must never be able to break model loading (e.g. console encoding errors).
+        try:
+            log(f"AI 模型已加载：{self.device}")
+        except Exception:
+            pass
 
     def _prepare(self, rgb: np.ndarray) -> np.ndarray:
         im = cv2.resize(rgb, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32)

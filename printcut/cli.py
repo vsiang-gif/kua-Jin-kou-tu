@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,7 +20,15 @@ def collect(paths: list[str]) -> list[Path]:
     return files
 
 
+def _force_utf8_console() -> None:
+    # Windows consoles default to cp1252/gbk; Chinese log lines would raise UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
+    _force_utf8_console()
     ap = argparse.ArgumentParser(description="PrintCut 批量抠印花")
     ap.add_argument("inputs", nargs="+")
     ap.add_argument("-o", "--output", required=True)
