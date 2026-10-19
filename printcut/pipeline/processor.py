@@ -21,7 +21,7 @@ from ..config import (
     Options,
 )
 from .export import compose_canvas, content_size, merge_rgba, save_png, smooth_alpha
-from .extract import classify, isolate_print, straighten
+from .extract import classify, find_shirt, isolate_print, straighten
 from .segment import Segmenter
 from .upscale import Upscaler
 from .vectorize import vectorize_print
@@ -99,6 +99,17 @@ class Processor:
         rgb = load_rgb(src)
         fg = self.segmenter.predict(rgb)
         ext = isolate_print(rgb, fg, o)
+        wants_ai = (
+            o.print_type == PRINT_PHOTO
+            or not ext.found
+            or (o.print_type == PRINT_AUTO and classify(ext.rgb, ext.alpha) == PRINT_PHOTO)
+        )
+        if wants_ai:
+            hint = self._print_hint(rgb, fg)
+            if hint is not None:
+                ext_ai = isolate_print(rgb, fg, o, print_hint=hint)
+                if ext_ai.found:
+                    ext = ext_ai
         result.reasons.extend(ext.notes)
         if not ext.found:
             result.error = "没有找到印花"
@@ -110,7 +121,13 @@ class Processor:
             if how:
                 result.reasons.append(how)
 
-        ptype = o.print_type if o.print_type != PRINT_AUTO else classify(crop, alpha)
+        if o.print_type != PRINT_AUTO:
+            ptype = o.print_type
+        elif ext.ai_matte:
+            # Only artwork the colour method could not separate gets here: paintings, portraits.
+            ptype = PRINT_PHOTO
+        else:
+            ptype = classify(crop, alpha)
         result.print_type = TYPE_NAMES.get(ptype, ptype)
         h, w = crop.shape[:2]
         tw, th = content_size(w, h, o.width, o.height, o.margin)
@@ -157,6 +174,39 @@ class Processor:
             svg_path = out.with_suffix(".svg")
             svg_path.write_text(svg_text, encoding="utf-8")
             result.svg = svg_path
+
+    def _print_hint(self, rgb: np.ndarray, fg: np.ndarray) -> np.ndarray | None:
+        """Second BiRefNet pass on the shirt alone: with the studio background gone,
+        the most salient thing left is the artwork itself."""
+        shirt, ai_grabbed_artwork = find_shirt(rgb, fg)
+        if ai_grabbed_artwork:
+            return fg * shirt
+        coverage = float(shirt.mean())
+        if not 0.03 <= coverage <= 0.85:
+            # Close-up of the fabric: the first pass already looked at the print.
+            fg_cover = float((fg > 0.5).mean())
+            return fg if 0.01 < fg_cover < 0.7 else None
+
+        m = min(shirt.shape)
+        r = max(3, int(m * 0.012))
+        inner = cv2.erode(shirt.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+        x, y, bw, bh = cv2.boundingRect(inner)
+        if bw < 32 or bh < 32:
+            return None
+        inside = inner[y:y + bh, x:x + bw] > 0
+        crop = rgb[y:y + bh, x:x + bw].copy()
+        rw = max(3, int(m * 0.03))
+        ring = inside & (cv2.erode(inside.astype(np.uint8), np.ones((2 * rw + 1, 2 * rw + 1), np.uint8)) == 0)
+        fabric = np.median(crop[ring if ring.any() else inside], axis=0)
+        crop[~inside] = fabric.astype(np.uint8)
+
+        pred = self.segmenter.predict(crop) * inside
+        area = float((pred > 0.5).sum())
+        if area > 0.75 * inside.sum() or area < 0.003 * inside.size:
+            return None
+        hint = np.zeros(rgb.shape[:2], np.float32)
+        hint[y:y + bh, x:x + bw] = pred
+        return hint
 
     def _write_log(self, r: Result) -> None:
         path = self.out_dir / LOG_FILE_NAME
