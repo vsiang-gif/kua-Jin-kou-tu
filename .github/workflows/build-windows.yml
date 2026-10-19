@@ -1,0 +1,73 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Cache models
+        id: cache-vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-birefnet-lite-esrgan-20220424-v1
+
+      - name: Download BiRefNet model and Real-ESRGAN
+        if: steps.cache-vendor.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force vendor/models, vendor/bin/realesrgan | Out-Null
+          Invoke-WebRequest "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx" -OutFile vendor/models/birefnet-general-lite.onnx
+          Invoke-WebRequest "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip" -OutFile esrgan.zip
+          Expand-Archive esrgan.zip -DestinationPath esrgan_tmp -Force
+          $exe = Get-ChildItem esrgan_tmp -Recurse -Filter realesrgan-ncnn-vulkan.exe | Select-Object -First 1
+          if (-not $exe) { throw "realesrgan-ncnn-vulkan.exe not found in archive" }
+          Copy-Item "$($exe.DirectoryName)\*" vendor/bin/realesrgan -Recurse -Force
+
+      - name: Smoke test (CLI on sample image)
+        run: python -m printcut.cli samples/shirt_graphic.png -o smoke_out
+
+      - name: Build exe
+        run: pyinstaller printcut.spec --noconfirm
+
+      - name: Bundle models next to exe
+        shell: pwsh
+        run: |
+          Copy-Item vendor/models dist/PrintCut/models -Recurse -Force
+          Copy-Item vendor/bin dist/PrintCut/bin -Recurse -Force
+          Copy-Item samples dist/PrintCut/示例图片 -Recurse -Force
+          7z a -tzip PrintCut-windows-x64.zip ./dist/PrintCut/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrintCut-windows-x64
+          path: PrintCut-windows-x64.zip
+          retention-days: 14
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PrintCut-windows-x64.zip
+          generate_release_notes: true
