@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
 
 from ..config import Options
-from ..pipeline import Processor, Result, get_segmenter, get_upscaler
+from ..pipeline import Processor, Result, get_parser, get_segmenter, get_upscaler
 
 
 class BatchWorker(QObject):
@@ -37,11 +37,13 @@ class BatchWorker(QObject):
         try:
             seg = get_segmenter()
             seg.load(self.log.emit)
+            parser = get_parser()
+            parser.load(self.log.emit)
             up = get_upscaler()
             if not up.available:
                 self.log.emit("未找到 Real-ESRGAN，照片类印花将用普通放大")
             self.out_dir.mkdir(parents=True, exist_ok=True)
-            proc = Processor(self.opts, self.out_dir, seg, up)
+            proc = Processor(self.opts, self.out_dir, seg, up, parser if parser.available else None)
 
             todo: list[Path] = []
             for f in self.files:

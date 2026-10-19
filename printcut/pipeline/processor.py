@@ -22,6 +22,7 @@ from ..config import (
 )
 from .export import compose_canvas, content_size, merge_rgba, save_png, smooth_alpha
 from .extract import classify, find_shirt, isolate_print, straighten
+from .parse import HumanParser, garment_mask
 from .segment import Segmenter
 from .upscale import Upscaler
 from .vectorize import vectorize_print
@@ -63,11 +64,13 @@ def load_rgb(path: Path) -> np.ndarray:
 
 
 class Processor:
-    def __init__(self, opts: Options, out_dir: Path, segmenter: Segmenter, upscaler: Upscaler) -> None:
+    def __init__(self, opts: Options, out_dir: Path, segmenter: Segmenter, upscaler: Upscaler,
+                 parser: HumanParser | None = None) -> None:
         self.opts = opts
         self.out_dir = Path(out_dir)
         self.segmenter = segmenter
         self.upscaler = upscaler
+        self.parser = parser
         self._log_lock = threading.Lock()
 
     def targets(self, src: Path) -> tuple[Path, Path]:
@@ -98,6 +101,11 @@ class Processor:
         o = self.opts
         rgb = load_rgb(src)
         fg = self.segmenter.predict(rgb)
+        garment = self._garment(rgb)
+        if garment is not None:
+            # Model photo: keep only the worn top so arms, face and jeans never count as print.
+            fg = np.maximum(fg, 0.0) * garment
+            result.reasons.append("AI 人体解析：只保留上衣，已排除手臂、脸、裤子")
         ext = isolate_print(rgb, fg, o)
         wants_ai = (
             o.print_type == PRINT_PHOTO
@@ -174,6 +182,15 @@ class Processor:
             svg_path = out.with_suffix(".svg")
             svg_path.write_text(svg_text, encoding="utf-8")
             result.svg = svg_path
+
+    def _garment(self, rgb: np.ndarray) -> np.ndarray | None:
+        if self.parser is None:
+            return None
+        labels = self.parser.predict(rgb)
+        if labels is None:
+            return None
+        mask = garment_mask(labels)
+        return None if mask is None else mask.astype(np.float32)
 
     def _print_hint(self, rgb: np.ndarray, fg: np.ndarray) -> np.ndarray | None:
         """Second BiRefNet pass on the shirt alone: with the studio background gone,

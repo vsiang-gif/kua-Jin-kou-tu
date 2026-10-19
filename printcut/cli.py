@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .config import IMAGE_EXTENSIONS, Options
-from .pipeline import Processor, get_segmenter, get_upscaler
+from .pipeline import Processor, get_parser, get_segmenter, get_upscaler
 
 
 def collect(paths: list[str]) -> list[Path]:
@@ -45,7 +45,9 @@ def main() -> None:
                    background="white" if args.white else "transparent", skip_existing=False)
     seg = get_segmenter()
     seg.load(print)
-    proc = Processor(opts, Path(args.output), seg, get_upscaler())
+    parser = get_parser()
+    parser.load(print)
+    proc = Processor(opts, Path(args.output), seg, get_upscaler(), parser if parser.available else None)
     files = collect(args.inputs)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         for i, r in enumerate(ex.map(proc.process, files), 1):
