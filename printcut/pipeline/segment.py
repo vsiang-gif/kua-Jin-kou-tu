@@ -31,6 +31,59 @@ def _noop(_: str) -> None:
     pass
 
 
+def download_model(path: Path, url: str, label: str, log: ProgressFn = _noop) -> Path:
+    if path.is_file() and path.stat().st_size > 1_000_000:
+        return path
+    log(f"首次运行：正在下载{label}…")
+    tmp = path.with_suffix(".part")
+    last_pct = -1
+
+    def hook(blocks: int, block_size: int, total: int) -> None:
+        nonlocal last_pct
+        if total > 0:
+            pct = min(100, blocks * block_size * 100 // total)
+            if pct != last_pct and pct % 5 == 0:
+                last_pct = pct
+                log(f"正在下载{label}… {pct}%")
+
+    urllib.request.urlretrieve(url, tmp, hook)
+    tmp.replace(path)
+    return path
+
+
+def open_session(path: Path, force_cpu: bool = False):
+    """onnxruntime session on the best available device: DirectML, CUDA, then CPU."""
+    import onnxruntime as ort
+
+    available = ort.get_available_providers()
+    attempts: list[list[str]] = []
+    if not force_cpu:
+        if "DmlExecutionProvider" in available:
+            attempts.append(["DmlExecutionProvider", "CPUExecutionProvider"])
+        if "CUDAExecutionProvider" in available:
+            attempts.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    attempts.append(["CPUExecutionProvider"])
+
+    last_error: Exception | None = None
+    for providers in attempts:
+        try:
+            opts = ort.SessionOptions()
+            if providers[0] == "DmlExecutionProvider":
+                # DirectML requires these two settings.
+                opts.enable_mem_pattern = False
+                opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            session = ort.InferenceSession(str(path), sess_options=opts, providers=providers)
+        except Exception as exc:  # provider failed, try the next one
+            last_error = exc
+            continue
+        device = {
+            "DmlExecutionProvider": "显卡加速（DirectML）",
+            "CUDAExecutionProvider": "显卡加速（CUDA）",
+        }.get(session.get_providers()[0], "CPU（较慢）")
+        return session, device
+    raise RuntimeError(f"AI 模型加载失败：{last_error}")
+
+
 class Segmenter:
     def __init__(self) -> None:
         self._load_lock = threading.Lock()
@@ -43,64 +96,16 @@ class Segmenter:
         return models_dir() / MODEL_FILE
 
     def ensure_model(self, log: ProgressFn = _noop) -> Path:
-        path = self.model_path()
-        if path.is_file() and path.stat().st_size > 1_000_000:
-            return path
-        log("首次运行：正在下载 BiRefNet 模型（约 220 MB）…")
-        tmp = path.with_suffix(".part")
-        last_pct = -1
-
-        def hook(blocks: int, block_size: int, total: int) -> None:
-            nonlocal last_pct
-            if total > 0:
-                pct = min(100, blocks * block_size * 100 // total)
-                if pct != last_pct and pct % 5 == 0:
-                    last_pct = pct
-                    log(f"正在下载模型… {pct}%")
-
-        urllib.request.urlretrieve(MODEL_URL, tmp, hook)
-        tmp.replace(path)
-        return path
+        return download_model(self.model_path(), MODEL_URL, " BiRefNet 模型（约 220 MB）", log)
 
     def load(self, log: ProgressFn = _noop, force_cpu: bool = False) -> None:
         with self._load_lock:
             if self._session is not None and not force_cpu:
                 return
-            import onnxruntime as ort
-
-            path = self.ensure_model(log)
-            available = ort.get_available_providers()
-            attempts: list[list[str]] = []
-            if not force_cpu:
-                if "DmlExecutionProvider" in available:
-                    attempts.append(["DmlExecutionProvider", "CPUExecutionProvider"])
-                if "CUDAExecutionProvider" in available:
-                    attempts.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
-            attempts.append(["CPUExecutionProvider"])
-
-            last_error: Exception | None = None
-            session = None
-            for providers in attempts:
-                try:
-                    opts = ort.SessionOptions()
-                    if providers[0] == "DmlExecutionProvider":
-                        # DirectML requires these two settings.
-                        opts.enable_mem_pattern = False
-                        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-                    session = ort.InferenceSession(str(path), sess_options=opts, providers=providers)
-                    break
-                except Exception as exc:  # provider failed, try the next one
-                    last_error = exc
-            if session is None:
-                raise RuntimeError(f"AI 模型加载失败：{last_error}")
-
-            active = session.get_providers()[0]
+            session, device = open_session(self.ensure_model(log), force_cpu)
             self._session = session
             self._input_name = session.get_inputs()[0].name
-            self.device = {
-                "DmlExecutionProvider": "显卡加速（DirectML）",
-                "CUDAExecutionProvider": "显卡加速（CUDA）",
-            }.get(active, "CPU（较慢）")
+            self.device = device
         # Logging must never be able to break model loading (e.g. console encoding errors).
         try:
             log(f"AI 模型已加载：{self.device}")
