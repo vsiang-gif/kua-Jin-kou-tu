@@ -298,9 +298,22 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self.toggle_run)
         lay.addWidget(self.progress, 1)
         lay.addWidget(self.status_label)
+        self.humbird_btn = QPushButton("蜂鸟订单")
+        self.humbird_btn.clicked.connect(self.open_humbird)
         lay.addWidget(self.open_btn)
+        lay.addWidget(self.humbird_btn)
         lay.addWidget(self.start_btn)
         return frame
+
+    def open_humbird(self) -> None:
+        from .humbird_window import HumbirdWindow
+
+        out = self.output_dir()
+        if out is None:
+            QMessageBox.information(self, "提示", "请先在右侧选择输出文件夹，蜂鸟订单的结果会放在里面。")
+            return
+        self._save_settings()
+        HumbirdWindow(self.current_options(), out, self).exec()
 
     # ---------- options ----------
     def _set_combo(self, combo: QComboBox, value) -> None:
@@ -427,7 +440,7 @@ class MainWindow(QMainWindow):
             return
         if r.error:
             self.out_pane.set_pixmap(None, "处理失败")
-            self.detail_label.setText(f"失败：{r.error}  {'；'.join(r.reasons)}")
+            self.detail_label.setText(f"失���：{r.error}  {'；'.join(r.reasons)}")
             return
         self.out_pane.set_pixmap(load_preview(r.output), "找不到结果文件")
         if r.skipped:
