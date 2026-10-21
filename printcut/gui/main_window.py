@@ -310,8 +310,11 @@ class MainWindow(QMainWindow):
 
         out = self.output_dir()
         if out is None:
-            QMessageBox.information(self, "提示", "请先在右侧选择输出文件夹，蜂鸟订单的结果会放在里面。")
-            return
+            folder = QFileDialog.getExistingDirectory(self, "选择蜂鸟订单结果的保存文件夹")
+            if not folder:
+                return
+            self.out_edit.setText(folder)
+            out = Path(folder)
         self._save_settings()
         HumbirdWindow(self.current_options(), out, self).exec()
 
