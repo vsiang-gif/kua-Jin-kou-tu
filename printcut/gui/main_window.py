@@ -483,7 +483,15 @@ class MainWindow(QMainWindow):
             return
         files = [Path(self.file_list.item(i).data(PATH_ROLE)) for i in range(self.file_list.count())]
         if not files:
-            QMessageBox.information(self, "提示", "请先添加图片或文件夹。")
+            answer = QMessageBox.question(
+                self,
+                "提示",
+                "还没有添加图片。\n\n"
+                "要处理蜂鸟「待设计」订单，请点「是」打开蜂鸟订单窗口；\n"
+                "要处理电脑上的图片，请点「否」，再用左侧「添加图片 / 添加文件夹」。",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.open_humbird()
             return
         out = self.output_dir()
         assert out is not None
