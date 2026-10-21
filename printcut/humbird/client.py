@@ -31,6 +31,12 @@ def parse_token(text: str) -> str:
     """Accepts a bare token, 'Bearer …', or a whole pasted cURL command."""
     m = _JWT.search(text or "")
     if not m:
+        if re.fullmatch(r"\s*[A-Za-z0-9+/]{16,}={0,2}\s*", text or ""):
+            raise HumbirdError(
+                "这是「开放平台 API Key」，不是登录令牌。\n"
+                "请在蜂鸟后台按 F12 → Network，点任意一个请求 → Headers，"
+                "复制 authorization 后面以 eyJ 开头的那一长串粘贴进来。"
+            )
         raise HumbirdError("没找到登录令牌（应该是以 eyJ 开头的一长串）")
     return m.group(0)
 
