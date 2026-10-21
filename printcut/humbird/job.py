@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -13,6 +14,8 @@ from .client import DesignTask, HumbirdClient, HumbirdError, download
 from .verify import Match, match_print, same_product, save_overlay
 
 MATCH_THRESHOLD = 0.90
+# Product photos and review previews are working files only; the result folder keeps just PNGs and records.
+CACHE = Path(tempfile.gettempdir()) / "printcut_cache"
 
 ST_REVIEW = "待审核"
 ST_MANUAL = "需人工处理"
@@ -138,6 +141,7 @@ def _best_cut(proc: Processor, src: Path, ref) -> tuple[Result, Match | None]:
 
 def process_task(client: HumbirdClient, proc: Processor, store: Store, task: DesignTask) -> Record:
     rec = Record.from_task(task)
+    src: Path | None = None
     try:
         matched = client.match_sku(task.sku)
         mismatches = same_product(task.color, task.size, task.image_url, matched, task.sku)
@@ -146,8 +150,8 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
         if not url:
             raise HumbirdError("订单里没有商品图")
         suffix = Path(url.split("?")[0]).suffix or ".jpg"
-        src = download(url, store.root / "原图" / f"{task.key}{suffix}")
-        rec.source = str(src)
+        src = download(url, CACHE / "原图" / f"{task.key}{suffix}")
+        rec.source = url
 
         ref = load_rgb(src)
         result, m = _best_cut(proc, src, ref)
@@ -163,7 +167,7 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
             rec.reasons.append("印花是空的")
             return rec
         rec.match_score = round(m.score, 3)
-        rec.overlay = str(save_overlay(ref, result.output, m, store.root / "比对" / f"{task.key}.jpg"))
+        rec.overlay = str(save_overlay(ref, result.output, m, CACHE / "比对" / f"{task.key}.jpg"))
         if m.score < MATCH_THRESHOLD:
             rec.reasons.insert(0, f"回贴比对只有 {m.score:.0%}，可能缺笔画或带了衣服底色")
         ok = not mismatches and m.score >= MATCH_THRESHOLD and result.score >= proc.opts.review_threshold
@@ -172,5 +176,7 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
         rec.status = ST_FAILED
         rec.reasons.append(str(exc) if isinstance(exc, HumbirdError) else f"{type(exc).__name__}: {exc}")
     finally:
+        if src is not None:
+            src.unlink(missing_ok=True)
         store.put(rec)
     return rec

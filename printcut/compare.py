@@ -1,4 +1,4 @@
-"""Compare our cut prints with reference cuts (e.g. downloaded from 灵图) and write an HTML report.
+"""Compare our cut prints with reference cuts (e.g. downloaded from 灵图) and write a CSV.
 
 python -m printcut.compare <我们的结果文件夹> <灵图结果文件夹> [-o 报告文件夹]
 """
@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import html
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +35,7 @@ class Row:
     edge: float = 0.0
     aspect: float = 0.0
     diagnosis: str = ""
-    image: str = ""
+    compared: bool = False
 
 
 def _pngs(folder: Path) -> list[Path]:
@@ -153,15 +152,7 @@ def compare(row: Row, out_dir: Path) -> None:
         row.diagnosis = DIAG_EXTRA
     else:
         row.diagnosis = DIAG_EDGE
-
-    diff = np.full((*size[::-1], 3), 255, np.uint8)
-    diff[r & o] = (200, 200, 200)
-    diff[o & ~r] = (220, 40, 40)
-    diff[r & ~o] = (40, 90, 230)
-    sheet = np.hstack([_pad(_on_checker(our_c)), _pad(_on_checker(ref_c)), _pad(diff)])
-    name = f"{len(list(out_dir.glob('*.jpg'))):04d}.jpg"
-    Image.fromarray(sheet).save(out_dir / name, quality=85)
-    row.image = name
+    row.compared = True
 
 
 def write_report(rows: list[Row], out_dir: Path) -> Path:
@@ -169,43 +160,25 @@ def write_report(rows: list[Row], out_dir: Path) -> Path:
     counts: dict[str, int] = {}
     for r in rows:
         counts[r.diagnosis] = counts.get(r.diagnosis, 0) + 1
-    scored = [r for r in rows if r.image]
+    scored = [r for r in rows if r.compared]
     avg = sum(r.iou for r in scored) / len(scored) if scored else 0
 
-    with open(out_dir / "对比结果.csv", "w", newline="", encoding="utf-8-sig") as f:
+    path = out_dir / "对比结果.csv"
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
+        w.writerow([f"共 {len(rows)} 张，平均重合度 {avg:.0%}"] +
+                   [f"{k} {v} 张" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])])
         w.writerow(["名称", "重合度", "漏抠比例", "多抠比例", "边缘误差", "判断", "我们的图", "灵图"])
         for r in rows:
             w.writerow([r.name, f"{r.iou:.0%}", f"{r.missing:.0%}", f"{r.extra:.0%}", f"{r.edge:.0%}",
                         r.diagnosis, str(r.ours or ""), str(r.ref)])
-
-    summary = "".join(
-        f"<li><b>{html.escape(k)}</b>：{v} 张</li>" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
-    items = []
-    for r in rows:
-        img = f'<img src="{r.image}" alt="{html.escape(r.name)} 对比图">' if r.image else ""
-        items.append(
-            f'<section><h2>{html.escape(r.name)} — {html.escape(r.diagnosis)}</h2>'
-            f'<p>重合度 {r.iou:.0%}　漏抠 {r.missing:.0%}　多抠 {r.extra:.0%}　边缘误差 {r.edge:.0%}</p>{img}</section>')
-    page = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>抠图对比报告</title>
-<style>body{{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:24px;color:#222;line-height:1.5}}
-section{{border-top:1px solid #ddd;padding:12px 0}}h2{{font-size:16px;margin:0}}img{{max-width:100%}}
-.legend span{{display:inline-block;width:12px;height:12px;margin:0 4px 0 12px;vertical-align:middle}}</style>
-<h1>抠图对比报告（我们 vs 灵图）</h1>
-<p>共 {len(rows)} 张，平均重合度 {avg:.0%}。最差的排在最前面。</p><ul>{summary}</ul>
-<p class="legend">每行三张图：我们的结果 ｜ 灵图的结果 ｜ 差异图
-<span style="background:#c8c8c8"></span>两边都有<span style="background:#dc2828"></span>只有我们有（多抠）
-<span style="background:#285ae6"></span>只有灵图有（漏抠）</p>
-{''.join(items)}</html>"""
-    path = out_dir / "对比报告.html"
-    path.write_text(page, encoding="utf-8")
     return path
 
 
 def run(ours_dir: Path, ref_dir: Path, out_dir: Path | None = None, log=print) -> Path:
     out_dir = Path(out_dir or Path(ours_dir) / "对比报告")
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("*.jpg"):
+    for old in [*out_dir.glob("*.jpg"), *out_dir.glob("*.html")]:
         old.unlink()
     refs = _pngs(Path(ref_dir)) + sorted(Path(ref_dir).rglob("*.jpg"))
     pairs = match(_pngs(Path(ours_dir)), refs)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
@@ -81,7 +82,7 @@ class OrderWorker(QObject):
             seg.load(self.log.emit)
             parser = get_parser()
             parser.load(self.log.emit)
-            proc = Processor(self.opts, self.store.root / "印花", seg, get_upscaler(),
+            proc = Processor(replace(self.opts, save_svg=False), self.store.root / "印花", seg, get_upscaler(),
                              parser if parser.available else None)
             counts = {ST_REVIEW: 0, ST_MANUAL: 0, ST_FAILED: 0}
             with ThreadPoolExecutor(max_workers=max(1, int(self.opts.workers))) as ex:
