@@ -9,8 +9,10 @@ from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -176,6 +178,10 @@ class HumbirdWindow(QDialog):
         self.approve_btn.setObjectName("primary")
         self.approve_btn.clicked.connect(lambda: self.decide(True))
         buttons.addWidget(self.folder_btn)
+        self.compare_btn = QPushButton("对比灵图结果")
+        self.compare_btn.setToolTip("选择存放灵图抠图结果的文件夹，生成对比报告（文件名要和订单号对应）")
+        self.compare_btn.clicked.connect(self.compare_reference)
+        buttons.addWidget(self.compare_btn)
         buttons.addStretch(1)
         buttons.addWidget(self.reject_btn)
         buttons.addWidget(self.approve_btn)
@@ -189,6 +195,25 @@ class HumbirdWindow(QDialog):
         self._set_buttons(None)
 
     # ---------- table ----------
+    def compare_reference(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择灵图抠图结果所在的文件夹")
+        if not folder:
+            return
+        from ..compare import run as run_compare
+
+        self.compare_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            report = run_compare(self.store.root, Path(folder), log=lambda _: QApplication.processEvents())
+        except Exception as exc:
+            traceback.print_exc()
+            QMessageBox.warning(self, "提示", f"对比失败：{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.compare_btn.setEnabled(True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(report)))
+
     def _row_of(self, key: str) -> int:
         for row in range(self.table.rowCount()):
             if self.table.item(row, 0).data(KEY_ROLE) == key:
