@@ -8,9 +8,9 @@ from datetime import datetime
 from pathlib import Path
 
 from ..pipeline import Processor
-from ..pipeline.processor import load_rgb
+from ..pipeline.processor import VARIANT_AI, VARIANT_AUTO, VARIANT_COLOR, VARIANT_FLAT, Result, load_rgb
 from .client import DesignTask, HumbirdClient, HumbirdError, download
-from .verify import match_print, same_product, save_overlay
+from .verify import Match, match_print, same_product, save_overlay
 
 MATCH_THRESHOLD = 0.90
 
@@ -83,6 +83,59 @@ class Store:
         return r
 
 
+VARIANTS = (
+    (VARIANT_AUTO, ""),
+    (VARIANT_AI, "AI 识别印花"),
+    (VARIANT_FLAT, "保留明暗"),
+    (VARIANT_COLOR, "按颜色分离"),
+)
+
+
+def _best_cut(proc: Processor, src: Path, ref) -> tuple[Result, Match | None]:
+    """Try several cut methods and keep the one that pastes back onto the product photo best.
+
+    No single method fits every mockup (flat text, photo prints, shaded renders), but the
+    product photo tells us which cut is right, so each one is checked against it.
+    """
+    best: tuple[float, Result, Match | None, Path | None, Path | None] | None = None
+    tried: list[Path] = []
+    for variant, label in VARIANTS:
+        res = proc.process(src, variant)
+        if res.error or res.output is None:
+            if best is None:
+                best = (-1.0, res, None, None, None)
+            continue
+        m = match_print(ref, res.output)
+        score = m.score if m else 0.0
+        keep_png = res.output.with_name(f"{res.output.stem}.{variant}.png")
+        shutil.copy2(res.output, keep_png)
+        keep_svg = None
+        if res.svg and res.svg.is_file():
+            keep_svg = res.svg.with_name(f"{res.svg.stem}.{variant}.svg")
+            shutil.copy2(res.svg, keep_svg)
+        tried += [p for p in (keep_png, keep_svg) if p]
+        if label:
+            res.reasons.insert(0, f"采用方案：{label}")
+        if best is None or score > best[0]:
+            best = (score, res, m, keep_png, keep_svg)
+        if score >= MATCH_THRESHOLD and res.score >= proc.opts.review_threshold:
+            break
+
+    assert best is not None
+    _, res, m, png, svg = best
+    if png is not None:
+        for stale in proc.targets(src):
+            for p in (stale, stale.with_suffix(".svg")):
+                if p.is_file() and p != res.output and p != res.svg:
+                    p.unlink()
+        shutil.copy2(png, res.output)
+        if svg is not None and res.svg is not None:
+            shutil.copy2(svg, res.svg)
+    for p in tried:
+        p.unlink(missing_ok=True)
+    return res, m
+
+
 def process_task(client: HumbirdClient, proc: Processor, store: Store, task: DesignTask) -> Record:
     rec = Record.from_task(task)
     try:
@@ -96,7 +149,8 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
         src = download(url, store.root / "原图" / f"{task.key}{suffix}")
         rec.source = str(src)
 
-        result = proc.process(src)
+        ref = load_rgb(src)
+        result, m = _best_cut(proc, src, ref)
         rec.cut_score = result.score
         rec.reasons.extend(result.reasons)
         if result.error or result.output is None:
@@ -104,9 +158,6 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
             rec.reasons.append(result.error or "没有生成印花")
             return rec
         rec.output = str(result.output)
-
-        ref = load_rgb(src)
-        m = match_print(ref, result.output)
         if m is None:
             rec.status = ST_MANUAL
             rec.reasons.append("印花是空的")

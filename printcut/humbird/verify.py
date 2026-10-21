@@ -28,6 +28,14 @@ def _load_print(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
     return rgba[y0:y1, x0:x1, :3], alpha[y0:y1, x0:x1]
 
 
+def _dominant_gray(gray: np.ndarray) -> float:
+    """Fabric is the single most common flat tone; a plain median lands inside big prints."""
+    hist = np.bincount(np.clip(gray, 0, 255).astype(np.uint8).ravel() // 8, minlength=32)
+    peak = int(np.argmax(hist)) * 8 + 4
+    near = gray[np.abs(gray - peak) < 12]
+    return float(np.median(near)) if near.size else float(peak)
+
+
 def match_print(ref_rgb: np.ndarray, print_png: Path) -> Match | None:
     """Slide the cut-out print over the product photo at many sizes; a faithful cut lines
     up almost perfectly somewhere, a broken one (missing strokes, leftover fabric) cannot."""
@@ -40,8 +48,7 @@ def match_print(ref_rgb: np.ndarray, print_png: Path) -> Match | None:
     ref = cv2.resize(ref_rgb, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
     ref_gray = cv2.cvtColor(ref, cv2.COLOR_RGB2GRAY).astype(np.float32)
     rh, rw = ref_gray.shape
-    cy, cx = rh // 2, rw // 2
-    fabric = float(np.median(ref_gray[cy - rh // 5:cy + rh // 5, cx - rw // 5:cx + rw // 5]))
+    fabric = _dominant_gray(ref_gray[rh // 5:rh - rh // 5, rw // 5:rw - rw // 5])
     p_gray = cv2.cvtColor(p_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
     ph, pw = p_gray.shape
@@ -75,13 +82,20 @@ def match_print(ref_rgb: np.ndarray, print_png: Path) -> Match | None:
     pad_x, pad_y = int(tw * 0.35), int(th * 0.35)
     x0, y0 = max(0, x - pad_x), max(0, y - pad_y)
     x1, y1 = min(rw, x + tw + pad_x), min(rh, y + th + pad_y)
-    window = ref_gray[y0:y1, x0:x1]
-    diff = np.abs(window - fabric)
-    thr = max(25.0, float(np.percentile(diff, 60)) * 2.5)
-    ink_ref = cv2.morphologyEx((diff > thr).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
-    ink_print = np.zeros_like(ink_ref)
+    ink_print = np.zeros((y1 - y0, x1 - x0), bool)
     ink_print[y - y0:y - y0 + th, x - x0:x - x0 + tw] = a > 0.5
     k = max(3, tw // 60) | 1
+
+    # Fabric colour measured right around the print (outside it), in LAB so coloured ink
+    # with the same brightness as the shirt still counts as ink.
+    lab = cv2.cvtColor(ref[y0:y1, x0:x1], cv2.COLOR_RGB2LAB).astype(np.float32)
+    outside = cv2.dilate(ink_print.astype(np.uint8), np.ones((k * 2 + 1, k * 2 + 1), np.uint8)) == 0
+    fab = np.median(lab[outside], axis=0) if outside.sum() > 50 else np.median(lab.reshape(-1, 3), axis=0)
+    diff = np.sqrt(0.5 * (lab[..., 0] - fab[0]) ** 2 + (lab[..., 1] - fab[1]) ** 2 + (lab[..., 2] - fab[2]) ** 2)
+    # Mockup shading (folds, gradients) varies around the print; ink must stand out from it.
+    spread = float(np.percentile(diff[outside], 90)) if outside.sum() > 50 else 0.0
+    thr = max(18.0, spread * 1.5)
+    ink_ref = cv2.morphologyEx((diff > thr).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
     near_print = cv2.dilate(ink_print.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
     near_ref = cv2.dilate(ink_ref.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
     recall = float((ink_ref & near_print).sum()) / max(1, int(ink_ref.sum()))
