@@ -139,6 +139,51 @@ def _best_cut(proc: Processor, src: Path, ref) -> tuple[Result, Match | None]:
     return res, m
 
 
+def product_image_url(client: HumbirdClient, task: DesignTask) -> str:
+    matched = client.match_sku(task.sku)
+    return str(matched.get("file_path") or task.image_url)
+
+
+def download_product_images(client: HumbirdClient, root: Path, log=print, stop=None) -> tuple[Path, int, int]:
+    """Save every pending-design product photo into <root>/商品图/<today>/ for manual cutting elsewhere.
+
+    Files are named <商户订单号>_<SKU> so cut results can be matched back to the order later.
+    """
+    folder = Path(root) / "商品图" / datetime.now().strftime("%Y-%m-%d")
+    folder.mkdir(parents=True, exist_ok=True)
+    log("正在拉取「待设计」订单…")
+    tasks = client.design_tasks()
+    rows: list[list[str]] = []
+    ok = failed = 0
+    for i, t in enumerate(tasks, 1):
+        if stop is not None and stop():
+            break
+        file_name, note = "", ""
+        try:
+            existing = next(iter(folder.glob(f"{t.key}.*")), None)
+            if existing is not None:
+                file_name, note = existing.name, "已存在"
+            else:
+                url = product_image_url(client, t)
+                if not url:
+                    raise HumbirdError("订单里没有商品图")
+                suffix = Path(url.split("?")[0]).suffix or ".jpg"
+                file_name = download(url, folder / f"{t.key}{suffix}").name
+            ok += 1
+        except Exception as exc:
+            failed += 1
+            note = str(exc) if isinstance(exc, HumbirdError) else f"{type(exc).__name__}: {exc}"
+        rows.append([t.third_order_id, t.store_name, t.sku, t.spec, t.name, file_name, note])
+        log(f"下载中 {i}/{len(tasks)}  {t.third_order_id}")
+
+    import csv
+    with (folder / "下载清单.csv").open("w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["商户订单号", "店铺", "SKU", "规格", "商品名", "文件名", "备注"])
+        w.writerows(rows)
+    return folder, ok, failed
+
+
 def process_task(client: HumbirdClient, proc: Processor, store: Store, task: DesignTask) -> Record:
     rec = Record.from_task(task)
     src: Path | None = None

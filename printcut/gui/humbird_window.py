@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from ..config import Options
 from ..humbird import HumbirdClient, HumbirdError, Record, Store, parse_token, process_task
+from ..humbird.job import download_product_images
 from ..humbird.job import FINAL, ST_APPROVED, ST_FAILED, ST_MANUAL, ST_REJECTED, ST_REVIEW
 from ..pipeline import Processor, get_parser, get_segmenter, get_upscaler
 from .widgets import PreviewPane, load_preview
@@ -112,6 +113,37 @@ class OrderWorker(QObject):
         return process_task(client, proc, self.store, task)
 
 
+class DownloadWorker(QObject):
+    log = Signal(str)
+    finished = Signal(str, str)
+
+    def __init__(self, token: str, root: Path) -> None:
+        super().__init__()
+        self.token, self.root = token, root
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    @Slot()
+    def run(self) -> None:
+        folder, summary = "", ""
+        try:
+            path, ok, failed = download_product_images(
+                HumbirdClient(self.token), self.root, self.log.emit, self._stop.is_set)
+            folder = str(path)
+            summary = f"下载完成：成功 {ok} 张，失败 {failed} 张。保存在：{path}"
+            if self._stop.is_set():
+                summary = "已停止。" + summary
+        except HumbirdError as exc:
+            summary = str(exc)
+        except Exception as exc:
+            traceback.print_exc()
+            summary = f"出错：{exc}"
+        finally:
+            self.finished.emit(summary, folder)
+
+
 class HumbirdWindow(QDialog):
     def __init__(self, opts: Options, out_root: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -122,6 +154,8 @@ class HumbirdWindow(QDialog):
         self.settings = QSettings("PrintCut", "PrintCut")
         self.thread: QThread | None = None
         self.worker: OrderWorker | None = None
+        self.dl_thread: QThread | None = None
+        self.dl_worker: DownloadWorker | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -135,6 +169,10 @@ class HumbirdWindow(QDialog):
         top.addWidget(self.token_edit, 1)
         self.redo_box = QCheckBox("重新处理已做过的")
         top.addWidget(self.redo_box)
+        self.download_btn = QPushButton("下载待设计商品图")
+        self.download_btn.setToolTip("把待设计订单的商品图下载到「商品图/今天日期」文件夹，用于手动上传灵图")
+        self.download_btn.clicked.connect(self.toggle_download)
+        top.addWidget(self.download_btn)
         self.run_btn = QPushButton("拉取待设计订单并抠图")
         self.run_btn.setObjectName("primary")
         self.run_btn.clicked.connect(self.toggle_run)
@@ -274,6 +312,50 @@ class HumbirdWindow(QDialog):
         row = self.table.currentRow()
         if row + 1 < self.table.rowCount():
             self.table.selectRow(row + 1)
+
+    # ---------- download ----------
+    def _token(self) -> str | None:
+        try:
+            token = parse_token(self.token_edit.text())
+        except HumbirdError as exc:
+            QMessageBox.warning(self, "提示", str(exc))
+            return None
+        self.token_edit.setText(token)
+        self.settings.setValue("humbird_token", token)
+        return token
+
+    def toggle_download(self) -> None:
+        if self.dl_worker is not None:
+            self.dl_worker.stop()
+            self.download_btn.setEnabled(False)
+            self.status.setText("正在停止下载…")
+            return
+        token = self._token()
+        if token is None:
+            return
+        self.download_btn.setText("停止下载")
+        self.run_btn.setEnabled(False)
+        self.dl_thread = QThread(self)
+        self.dl_worker = DownloadWorker(token, self.store.root)
+        self.dl_worker.moveToThread(self.dl_thread)
+        self.dl_thread.started.connect(self.dl_worker.run)
+        self.dl_worker.log.connect(self.status.setText)
+        self.dl_worker.finished.connect(self._on_download_finished)
+        self.dl_worker.finished.connect(self.dl_thread.quit)
+        self.dl_thread.finished.connect(self.dl_thread.deleteLater)
+        self.dl_thread.start()
+
+    def _on_download_finished(self, summary: str, folder: str) -> None:
+        self.dl_worker = None
+        self.dl_thread = None
+        self.download_btn.setText("下载待设计商品图")
+        self.download_btn.setEnabled(True)
+        self.run_btn.setEnabled(self.worker is None)
+        self.status.setText(summary)
+        if "令牌" in summary:
+            QMessageBox.warning(self, "登录失效", summary)
+        elif folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     # ---------- run ----------
     def toggle_run(self) -> None:
