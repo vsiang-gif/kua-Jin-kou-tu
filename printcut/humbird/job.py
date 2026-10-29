@@ -144,23 +144,65 @@ def product_image_url(client: HumbirdClient, task: DesignTask) -> str:
     return str(matched.get("file_path") or task.image_url)
 
 
-def download_product_images(client: HumbirdClient, root: Path, log=print, stop=None) -> tuple[Path, int, int]:
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+# Bits (of 256) two photos may differ by and still count as the same design.
+DUPLICATE_BITS = 24
+
+
+def image_hash(path: Path) -> int:
+    """Difference hash on a 17x16 grey thumbnail: robust to resizing, recompression and small shifts."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        grey = im.convert("L").resize((17, 16), Image.LANCZOS)
+        px = list(grey.getdata())
+    bits = 0
+    for y in range(16):
+        row = px[y * 17:(y + 1) * 17]
+        for x in range(16):
+            bits = (bits << 1) | (row[x] > row[x + 1])
+    return bits
+
+
+def find_duplicate(h: int, seen: list[tuple[int, str]]) -> str | None:
+    best: tuple[int, str] | None = None
+    for other, name in seen:
+        d = (h ^ other).bit_count()
+        if d <= DUPLICATE_BITS and (best is None or d < best[0]):
+            best = (d, name)
+    return best[1] if best else None
+
+
+def download_product_images(client: HumbirdClient, root: Path, log=print, stop=None) -> tuple[Path, int, int, int]:
     """Save every pending-design product photo into <root>/商品图/<today>/ for manual cutting elsewhere.
 
     Files are named <商户订单号>_<SKU> so cut results can be matched back to the order later.
+    Orders whose photo shows the same design as one already saved are not saved again, so each
+    print only needs cutting once; 下载清单.csv records which saved image each order shares.
     """
     folder = Path(root) / "商品图" / datetime.now().strftime("%Y-%m-%d")
     folder.mkdir(parents=True, exist_ok=True)
+    tmp_dir = CACHE / "下载"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    seen: list[tuple[int, str]] = []
+    for p in sorted(folder.iterdir()):
+        if p.suffix.lower() in IMAGE_SUFFIXES:
+            try:
+                seen.append((image_hash(p), p.name))
+            except Exception:
+                pass
+
     log("正在拉取「待设计」订单…")
     tasks = client.design_tasks()
     rows: list[list[str]] = []
-    ok = failed = 0
+    ok = failed = dup = 0
     for i, t in enumerate(tasks, 1):
         if stop is not None and stop():
             break
         file_name, note = "", ""
         try:
-            existing = next(iter(folder.glob(f"{t.key}.*")), None)
+            existing = next((p for p in folder.glob(f"{t.key}.*") if p.suffix.lower() in IMAGE_SUFFIXES), None)
             if existing is not None:
                 file_name, note = existing.name, "已存在"
             else:
@@ -168,20 +210,32 @@ def download_product_images(client: HumbirdClient, root: Path, log=print, stop=N
                 if not url:
                     raise HumbirdError("订单里没有商品图")
                 suffix = Path(url.split("?")[0]).suffix or ".jpg"
-                file_name = download(url, folder / f"{t.key}{suffix}").name
+                tmp = download(url, tmp_dir / f"{t.key}{suffix}")
+                h = image_hash(tmp)
+                same = find_duplicate(h, seen)
+                if same is not None:
+                    tmp.unlink(missing_ok=True)
+                    file_name, note = same, "重复印花，未单独保存"
+                    dup += 1
+                else:
+                    target = folder / tmp.name
+                    shutil.move(str(tmp), target)
+                    seen.append((h, target.name))
+                    file_name = target.name
             ok += 1
         except Exception as exc:
             failed += 1
             note = str(exc) if isinstance(exc, HumbirdError) else f"{type(exc).__name__}: {exc}"
         rows.append([t.third_order_id, t.store_name, t.sku, t.spec, t.name, file_name, note])
-        log(f"下载中 {i}/{len(tasks)}  {t.third_order_id}")
+        log(f"下载中 {i}/{len(tasks)}  {t.third_order_id}" + ("（重复，跳过）" if note.startswith("重复") else ""))
 
     import csv
+    rows.sort(key=lambda r: (r[5], r[0]))
     with (folder / "下载清单.csv").open("w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["商户订单号", "店铺", "SKU", "规格", "商品名", "文件名", "备注"])
+        w.writerow(["商户订单号", "店铺", "SKU", "规格", "商品名", "使用图片（同一印花）", "备注"])
         w.writerows(rows)
-    return folder, ok, failed
+    return folder, ok, failed, dup
 
 
 def process_task(client: HumbirdClient, proc: Processor, store: Store, task: DesignTask) -> Record:

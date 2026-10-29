@@ -129,10 +129,11 @@ class DownloadWorker(QObject):
     def run(self) -> None:
         folder, summary = "", ""
         try:
-            path, ok, failed = download_product_images(
+            path, ok, failed, dup = download_product_images(
                 HumbirdClient(self.token), self.root, self.log.emit, self._stop.is_set)
             folder = str(path)
-            summary = f"下载完成：成功 {ok} 张，失败 {failed} 张。保存在：{path}"
+            summary = (f"下载完成：新印花 {ok - dup} 张，重复印花已跳过 {dup} 个订单，失败 {failed} 张。"
+                       f"对应关系见 下载清单.csv。保存在：{path}")
             if self._stop.is_set():
                 summary = "已停止。" + summary
         except HumbirdError as exc:
