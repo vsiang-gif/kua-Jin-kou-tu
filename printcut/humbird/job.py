@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from ..pipeline import Processor
-from ..pipeline.processor import load_rgb
+from ..pipeline.processor import VARIANT_AI, VARIANT_AUTO, VARIANT_COLOR, VARIANT_FLAT, Result, load_rgb
 from .client import DesignTask, HumbirdClient, HumbirdError, download
-from .verify import match_print, same_product, save_overlay
+from .verify import Match, match_print, same_product, save_overlay
 
 MATCH_THRESHOLD = 0.90
+# Product photos and review previews are working files only; the result folder keeps just PNGs and records.
+CACHE = Path(tempfile.gettempdir()) / "printcut_cache"
 
 ST_REVIEW = "待审核"
 ST_MANUAL = "需人工处理"
@@ -83,8 +86,107 @@ class Store:
         return r
 
 
+VARIANTS = (
+    (VARIANT_AUTO, ""),
+    (VARIANT_AI, "AI 识别印花"),
+    (VARIANT_FLAT, "保留明暗"),
+    (VARIANT_COLOR, "按颜色分离"),
+)
+
+
+def _best_cut(proc: Processor, src: Path, ref) -> tuple[Result, Match | None]:
+    """Try several cut methods and keep the one that pastes back onto the product photo best.
+
+    No single method fits every mockup (flat text, photo prints, shaded renders), but the
+    product photo tells us which cut is right, so each one is checked against it.
+    """
+    best: tuple[float, Result, Match | None, Path | None, Path | None] | None = None
+    tried: list[Path] = []
+    for variant, label in VARIANTS:
+        res = proc.process(src, variant)
+        if res.error or res.output is None:
+            if best is None:
+                best = (-1.0, res, None, None, None)
+            continue
+        m = match_print(ref, res.output)
+        score = m.score if m else 0.0
+        keep_png = res.output.with_name(f"{res.output.stem}.{variant}.png")
+        shutil.copy2(res.output, keep_png)
+        keep_svg = None
+        if res.svg and res.svg.is_file():
+            keep_svg = res.svg.with_name(f"{res.svg.stem}.{variant}.svg")
+            shutil.copy2(res.svg, keep_svg)
+        tried += [p for p in (keep_png, keep_svg) if p]
+        if label:
+            res.reasons.insert(0, f"采用方案：{label}")
+        if best is None or score > best[0]:
+            best = (score, res, m, keep_png, keep_svg)
+        if score >= MATCH_THRESHOLD and res.score >= proc.opts.review_threshold:
+            break
+
+    assert best is not None
+    _, res, m, png, svg = best
+    if png is not None:
+        for stale in proc.targets(src):
+            for p in (stale, stale.with_suffix(".svg")):
+                if p.is_file() and p != res.output and p != res.svg:
+                    p.unlink()
+        shutil.copy2(png, res.output)
+        if svg is not None and res.svg is not None:
+            shutil.copy2(svg, res.svg)
+    for p in tried:
+        p.unlink(missing_ok=True)
+    return res, m
+
+
+def product_image_url(client: HumbirdClient, task: DesignTask) -> str:
+    matched = client.match_sku(task.sku)
+    return str(matched.get("file_path") or task.image_url)
+
+
+def download_product_images(client: HumbirdClient, root: Path, log=print, stop=None) -> tuple[Path, int, int]:
+    """Save every pending-design product photo into <root>/商品图/<today>/ for manual cutting elsewhere.
+
+    Files are named <商户订单号>_<SKU> so cut results can be matched back to the order later.
+    """
+    folder = Path(root) / "商品图" / datetime.now().strftime("%Y-%m-%d")
+    folder.mkdir(parents=True, exist_ok=True)
+    log("正在拉取「待设计」订单…")
+    tasks = client.design_tasks()
+    rows: list[list[str]] = []
+    ok = failed = 0
+    for i, t in enumerate(tasks, 1):
+        if stop is not None and stop():
+            break
+        file_name, note = "", ""
+        try:
+            existing = next(iter(folder.glob(f"{t.key}.*")), None)
+            if existing is not None:
+                file_name, note = existing.name, "已存在"
+            else:
+                url = product_image_url(client, t)
+                if not url:
+                    raise HumbirdError("订单里没有商品图")
+                suffix = Path(url.split("?")[0]).suffix or ".jpg"
+                file_name = download(url, folder / f"{t.key}{suffix}").name
+            ok += 1
+        except Exception as exc:
+            failed += 1
+            note = str(exc) if isinstance(exc, HumbirdError) else f"{type(exc).__name__}: {exc}"
+        rows.append([t.third_order_id, t.store_name, t.sku, t.spec, t.name, file_name, note])
+        log(f"下载中 {i}/{len(tasks)}  {t.third_order_id}")
+
+    import csv
+    with (folder / "下载清单.csv").open("w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["商户订单号", "店铺", "SKU", "规格", "商品名", "文件名", "备注"])
+        w.writerows(rows)
+    return folder, ok, failed
+
+
 def process_task(client: HumbirdClient, proc: Processor, store: Store, task: DesignTask) -> Record:
     rec = Record.from_task(task)
+    src: Path | None = None
     try:
         matched = client.match_sku(task.sku)
         mismatches = same_product(task.color, task.size, task.image_url, matched, task.sku)
@@ -93,10 +195,11 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
         if not url:
             raise HumbirdError("订单里没有商品图")
         suffix = Path(url.split("?")[0]).suffix or ".jpg"
-        src = download(url, store.root / "原图" / f"{task.key}{suffix}")
-        rec.source = str(src)
+        src = download(url, CACHE / "原图" / f"{task.key}{suffix}")
+        rec.source = url
 
-        result = proc.process(src)
+        ref = load_rgb(src)
+        result, m = _best_cut(proc, src, ref)
         rec.cut_score = result.score
         rec.reasons.extend(result.reasons)
         if result.error or result.output is None:
@@ -104,15 +207,12 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
             rec.reasons.append(result.error or "没有生成印花")
             return rec
         rec.output = str(result.output)
-
-        ref = load_rgb(src)
-        m = match_print(ref, result.output)
         if m is None:
             rec.status = ST_MANUAL
             rec.reasons.append("印花是空的")
             return rec
         rec.match_score = round(m.score, 3)
-        rec.overlay = str(save_overlay(ref, result.output, m, store.root / "比对" / f"{task.key}.jpg"))
+        rec.overlay = str(save_overlay(ref, result.output, m, CACHE / "比对" / f"{task.key}.jpg"))
         if m.score < MATCH_THRESHOLD:
             rec.reasons.insert(0, f"回贴比对只有 {m.score:.0%}，可能缺笔画或带了衣服底色")
         ok = not mismatches and m.score >= MATCH_THRESHOLD and result.score >= proc.opts.review_threshold
@@ -121,5 +221,7 @@ def process_task(client: HumbirdClient, proc: Processor, store: Store, task: Des
         rec.status = ST_FAILED
         rec.reasons.append(str(exc) if isinstance(exc, HumbirdError) else f"{type(exc).__name__}: {exc}")
     finally:
+        if src is not None:
+            src.unlink(missing_ok=True)
         store.put(rec)
     return rec

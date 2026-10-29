@@ -5,6 +5,7 @@ calls onnxruntime directly so the packaged .exe does not pull in numba/pymatting
 """
 from __future__ import annotations
 
+import os
 import threading
 import urllib.request
 from pathlib import Path
@@ -20,6 +21,14 @@ MODEL_URL = (
     "https://github.com/danielgatis/rembg/releases/download/v0.0.0/"
     "BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx"
 )
+# Swin-Large backbone: much sharper edges on thin strokes, text and soft prints,
+# but about 4x the size and too slow without a GPU.
+FULL_MODEL_FILE = "birefnet-general.onnx"
+FULL_MODEL_URL = (
+    "https://github.com/danielgatis/rembg/releases/download/v0.0.0/"
+    "BiRefNet-general-epoch_244.onnx"
+)
+QUALITY_ENV = "PRINTCUT_SEG_MODEL"  # "full" / "lite"; unset = full when a GPU is present
 INPUT_SIZE = 1024
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -92,20 +101,56 @@ class Segmenter:
         self._input_name = ""
         self.device = "未加载"
 
+        self.quality = "lite"
+
     def model_path(self) -> Path:
         return models_dir() / MODEL_FILE
 
     def ensure_model(self, log: ProgressFn = _noop) -> Path:
         return download_model(self.model_path(), MODEL_URL, " BiRefNet 模型（约 220 MB）", log)
 
+    @staticmethod
+    def _wants_full(force_cpu: bool) -> bool:
+        choice = os.environ.get(QUALITY_ENV, "").strip().lower()
+        if choice in ("lite", "fast", "标准"):
+            return False
+        if choice in ("full", "hq", "高精度"):
+            return True
+        if force_cpu:
+            return False
+        try:
+            import onnxruntime as ort
+            gpu = {"DmlExecutionProvider", "CUDAExecutionProvider"}
+            return bool(gpu & set(ort.get_available_providers()))
+        except Exception:
+            return False
+
+    def _open_full(self, log: ProgressFn, force_cpu: bool):
+        path = download_model(models_dir() / FULL_MODEL_FILE, FULL_MODEL_URL,
+                              "高精度 BiRefNet 模型（约 970 MB，只下载一次）", log)
+        return open_session(path, force_cpu)
+
     def load(self, log: ProgressFn = _noop, force_cpu: bool = False) -> None:
         with self._load_lock:
             if self._session is not None and not force_cpu:
                 return
-            session, device = open_session(self.ensure_model(log), force_cpu)
+            session = device = None
+            quality = "lite"
+            if self._wants_full(force_cpu):
+                try:
+                    session, device = self._open_full(log, force_cpu)
+                    quality = "full"
+                except Exception as exc:
+                    try:
+                        log(f"高精度模型不可用，改用标准模型：{exc}")
+                    except Exception:
+                        pass
+            if session is None:
+                session, device = open_session(self.ensure_model(log), force_cpu)
             self._session = session
             self._input_name = session.get_inputs()[0].name
-            self.device = device
+            self.device = f"{device} · {'高精度模型' if quality == 'full' else '标准模型'}"
+            self.quality = quality
         # Logging must never be able to break model loading (e.g. console encoding errors).
         try:
             log(f"AI 模型已加载：{self.device}")

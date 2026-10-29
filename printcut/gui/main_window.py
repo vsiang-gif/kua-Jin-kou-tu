@@ -310,8 +310,11 @@ class MainWindow(QMainWindow):
 
         out = self.output_dir()
         if out is None:
-            QMessageBox.information(self, "提示", "请先在右侧选择输出文件夹，蜂鸟订单的结果会放在里面。")
-            return
+            folder = QFileDialog.getExistingDirectory(self, "选择蜂鸟订单结果的保存文件夹")
+            if not folder:
+                return
+            self.out_edit.setText(folder)
+            out = Path(folder)
         self._save_settings()
         HumbirdWindow(self.current_options(), out, self).exec()
 
@@ -480,7 +483,15 @@ class MainWindow(QMainWindow):
             return
         files = [Path(self.file_list.item(i).data(PATH_ROLE)) for i in range(self.file_list.count())]
         if not files:
-            QMessageBox.information(self, "提示", "请先添加图片或文件夹。")
+            answer = QMessageBox.question(
+                self,
+                "提示",
+                "还没有添加图片。\n\n"
+                "要处理蜂鸟「待设计」订单，请点「是」打开蜂鸟订单窗口；\n"
+                "要处理电脑上的图片，请点「否」，再用左侧「添加图片 / 添加文件夹」。",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.open_humbird()
             return
         out = self.output_dir()
         assert out is not None

@@ -4,7 +4,7 @@ import csv
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +28,10 @@ from .upscale import Upscaler
 from .vectorize import vectorize_print
 
 MAX_INPUT_SIDE = 6000
+VARIANT_AUTO = "auto"
+VARIANT_COLOR = "color"
+VARIANT_AI = "ai"
+VARIANT_FLAT = "flat"
 TYPE_NAMES = {PRINT_GRAPHIC: "文字图形", PRINT_PHOTO: "照片插画"}
 
 
@@ -83,12 +87,14 @@ class Processor:
                 return p
         return None
 
-    def process(self, src: Path) -> Result:
+    def process(self, src: Path, variant: str = VARIANT_AUTO) -> Result:
+        """variant: VARIANT_AUTO decides by itself; VARIANT_COLOR / VARIANT_AI / VARIANT_FLAT
+        force one method so a caller that can verify the result may try them all."""
         src = Path(src)
         started = time.perf_counter()
         result = Result(source=src)
         try:
-            self._run(src, result)
+            self._run(src, result, variant)
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             result.reasons.append("处理出错")
@@ -97,8 +103,12 @@ class Processor:
         self._write_log(result)
         return result
 
-    def _run(self, src: Path, result: Result) -> None:
+    def _run(self, src: Path, result: Result, variant: str = VARIANT_AUTO) -> None:
         o = self.opts
+        if variant == VARIANT_FLAT:
+            # Mockup renders often carry fake fabric shading inside the print; wrinkle
+            # removal can then erase real ink, so this variant keeps every shade.
+            o = replace(o, dewrinkle=False)
         rgb = load_rgb(src)
         fg = self.segmenter.predict(rgb)
         garment = self._garment(rgb)
@@ -107,17 +117,25 @@ class Processor:
             fg = np.maximum(fg, 0.0) * garment
             result.reasons.append("AI 人体解析：只保留上衣，已排除手臂、脸、裤子")
         ext = isolate_print(rgb, fg, o)
-        wants_ai = (
-            o.print_type == PRINT_PHOTO
-            or not ext.found
-            or (o.print_type == PRINT_AUTO and classify(ext.rgb, ext.alpha) == PRINT_PHOTO)
-        )
+        if variant == VARIANT_AI:
+            wants_ai = True
+        elif variant in (VARIANT_COLOR, VARIANT_FLAT):
+            wants_ai = not ext.found
+        else:
+            wants_ai = (
+                o.print_type == PRINT_PHOTO
+                or not ext.found
+                or (o.print_type == PRINT_AUTO and classify(ext.rgb, ext.alpha) == PRINT_PHOTO)
+            )
         if wants_ai:
             hint = self._print_hint(rgb, fg)
             if hint is not None:
                 ext_ai = isolate_print(rgb, fg, o, print_hint=hint)
                 if ext_ai.found:
                     ext = ext_ai
+            elif variant == VARIANT_AI:
+                result.error = "AI 没有单独识别出印花"
+                return
         result.reasons.extend(ext.notes)
         if not ext.found:
             result.error = "没有找到印花"
