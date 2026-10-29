@@ -62,11 +62,17 @@ jobs:
           Copy-Item samples dist/PrintCut/示例图片 -Recurse -Force
           7z a -tzip PrintCut-windows-x64.zip ./dist/PrintCut/*
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: PrintCut-windows-x64
-          path: PrintCut-windows-x64.zip
-          retention-days: 14
+      # Release assets don't count toward the Actions artifact storage quota,
+      # so main builds are published to a rolling "latest" prerelease.
+      - name: Publish rolling latest build
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes 2>$null
+          $global:LASTEXITCODE = 0
+          gh release create latest PrintCut-windows-x64.zip --prerelease --target $env:GITHUB_SHA --title "最新构建 (main)" --notes "自动构建，提交 $env:GITHUB_SHA"
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
