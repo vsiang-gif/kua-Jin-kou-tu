@@ -145,6 +145,40 @@ class DownloadWorker(QObject):
             self.finished.emit(summary, folder)
 
 
+class LinkWorker(QObject):
+    log = Signal(str)
+    finished = Signal(str, str)
+
+    def __init__(self, token: str, root: Path) -> None:
+        super().__init__()
+        self.token, self.root = token, root
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    @Slot()
+    def run(self) -> None:
+        report, summary = "", ""
+        try:
+            from ..humbird.link import auto_link
+
+            path, linked, missing, manual = auto_link(
+                HumbirdClient(self.token), self.root, self.log.emit, self._stop.is_set)
+            report = str(path)
+            summary = (f"关联完成：已关联 {linked} 个，图库里没找到同名的 {missing} 个，"
+                       f"需要手动处理 {manual} 个。明细见：{path.name}")
+            if self._stop.is_set():
+                summary = "已停止。" + summary
+        except HumbirdError as exc:
+            summary = str(exc)
+        except Exception as exc:
+            traceback.print_exc()
+            summary = f"出错：{exc}"
+        finally:
+            self.finished.emit(summary, report)
+
+
 class HumbirdWindow(QDialog):
     def __init__(self, opts: Options, out_root: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -157,6 +191,8 @@ class HumbirdWindow(QDialog):
         self.worker: OrderWorker | None = None
         self.dl_thread: QThread | None = None
         self.dl_worker: DownloadWorker | None = None
+        self.link_thread: QThread | None = None
+        self.link_worker: LinkWorker | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -174,6 +210,10 @@ class HumbirdWindow(QDialog):
         self.download_btn.setToolTip("把待设计订单的商品图下载到「商品图/今天日期」文件夹，用于手动上传灵图")
         self.download_btn.clicked.connect(self.toggle_download)
         top.addWidget(self.download_btn)
+        self.link_btn = QPushButton("按名称自动关联")
+        self.link_btn.setToolTip("图库商品的「主题名称」等于 WB订单号_SKU 时，自动完成「关联商品」，颜色尺码由蜂鸟核对")
+        self.link_btn.clicked.connect(self.toggle_link)
+        top.addWidget(self.link_btn)
         self.run_btn = QPushButton("拉取待设计订单并抠图")
         self.run_btn.setObjectName("primary")
         self.run_btn.clicked.connect(self.toggle_run)
@@ -357,6 +397,44 @@ class HumbirdWindow(QDialog):
             QMessageBox.warning(self, "登录失效", summary)
         elif folder:
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    # ---------- link ----------
+    def toggle_link(self) -> None:
+        if self.link_worker is not None:
+            self.link_worker.stop()
+            self.link_btn.setEnabled(False)
+            self.status.setText("正在停止关联…")
+            return
+        token = self._token()
+        if token is None:
+            return
+        ok = QMessageBox.question(
+            self, "确认自动关联",
+            "只会关联图库「主题名称」和 WB订单号_SKU 完全一致、且蜂鸟核对颜色尺码无误的订单，"
+            "其余的会列在报告里留给你手动处理。\n\n确定开始吗？")
+        if ok != QMessageBox.Yes:
+            return
+        self.link_btn.setText("停止关联")
+        self.link_thread = QThread(self)
+        self.link_worker = LinkWorker(token, self.store.root)
+        self.link_worker.moveToThread(self.link_thread)
+        self.link_thread.started.connect(self.link_worker.run)
+        self.link_worker.log.connect(self.status.setText)
+        self.link_worker.finished.connect(self._on_link_finished)
+        self.link_worker.finished.connect(self.link_thread.quit)
+        self.link_thread.finished.connect(self.link_thread.deleteLater)
+        self.link_thread.start()
+
+    def _on_link_finished(self, summary: str, report: str) -> None:
+        self.link_worker = None
+        self.link_thread = None
+        self.link_btn.setText("按名称自动关联")
+        self.link_btn.setEnabled(True)
+        self.status.setText(summary)
+        if "令牌" in summary:
+            QMessageBox.warning(self, "登录失效", summary)
+        elif report:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(report))
 
     # ---------- run ----------
     def toggle_run(self) -> None:
