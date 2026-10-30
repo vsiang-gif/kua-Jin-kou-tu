@@ -147,7 +147,7 @@ class DownloadWorker(QObject):
 
 class LinkWorker(QObject):
     log = Signal(str)
-    finished = Signal(str, str)
+    finished = Signal(str, str, object)
 
     def __init__(self, token: str, root: Path) -> None:
         super().__init__()
@@ -159,15 +159,15 @@ class LinkWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        report, summary = "", ""
+        report, summary, reviews = "", "", []
         try:
             from ..humbird.link import auto_link
 
-            path, linked, missing, manual = auto_link(
+            path, counts, reviews = auto_link(
                 HumbirdClient(self.token), self.root, self.log.emit, self._stop.is_set)
             report = str(path)
-            summary = (f"关联完成：已关联 {linked} 个，图库里没找到同名的 {missing} 个，"
-                       f"需要手动处理 {manual} 个。明细见：{path.name}")
+            summary = (f"关联完成：按名称 {counts['name']} 个，按记忆 {counts['memory']} 个，"
+                       f"识图 {counts['image']} 个，待人工确认 {counts['review']} 个。明细见：{path.name}")
             if self._stop.is_set():
                 summary = "已停止。" + summary
         except HumbirdError as exc:
@@ -176,7 +176,7 @@ class LinkWorker(QObject):
             traceback.print_exc()
             summary = f"出错：{exc}"
         finally:
-            self.finished.emit(summary, report)
+            self.finished.emit(summary, report, reviews)
 
 
 class HumbirdWindow(QDialog):
@@ -425,7 +425,7 @@ class HumbirdWindow(QDialog):
         self.link_thread.finished.connect(self.link_thread.deleteLater)
         self.link_thread.start()
 
-    def _on_link_finished(self, summary: str, report: str) -> None:
+    def _on_link_finished(self, summary: str, report: str, reviews: object = None) -> None:
         self.link_worker = None
         self.link_thread = None
         self.link_btn.setText("按名称自动关联")
@@ -433,6 +433,16 @@ class HumbirdWindow(QDialog):
         self.status.setText(summary)
         if "令牌" in summary:
             QMessageBox.warning(self, "登录失效", summary)
+            return
+        pending = [r for r in (reviews or []) if r.candidates]
+        token = self._token() if pending else None
+        if pending and token:
+            from .link_review import LinkReviewDialog
+
+            dlg = LinkReviewDialog(token, self.store.root, pending, self)
+            dlg.resize(1400, 680)
+            dlg.exec()
+            self.status.setText(summary + "　" + dlg.summary())
         elif report:
             QDesktopServices.openUrl(QUrl.fromLocalFile(report))
 
