@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -48,8 +52,13 @@ jobs:
           if (-not $exe) { throw "realesrgan-ncnn-vulkan.exe not found in archive" }
           Copy-Item "$($exe.DirectoryName)\*" vendor/bin/realesrgan -Recurse -Force
 
+      # Full CLI smoke test takes ~3.5 min on CPU; only run it for tagged releases.
       - name: Smoke test (CLI on sample image)
+        if: startsWith(github.ref, 'refs/tags/v')
         run: python -m printcut.cli samples/shirt_graphic.png -o smoke_out
+
+      - name: Import check
+        run: python -c "import printcut.cli, printcut.humbird.job, printcut.gui"
 
       - name: Build exe
         run: pyinstaller printcut.spec --noconfirm
@@ -60,7 +69,7 @@ jobs:
           Copy-Item vendor/models dist/PrintCut/models -Recurse -Force
           Copy-Item vendor/bin dist/PrintCut/bin -Recurse -Force
           Copy-Item samples dist/PrintCut/示例图片 -Recurse -Force
-          7z a -tzip PrintCut-windows-x64.zip ./dist/PrintCut/*
+          7z a -tzip -mx=1 PrintCut-windows-x64.zip ./dist/PrintCut/*
 
       # Release assets don't count toward the Actions artifact storage quota,
       # so main builds are published to a rolling "latest" prerelease.
@@ -70,9 +79,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --cleanup-tag --yes 2>$null
-          $global:LASTEXITCODE = 0
-          gh release create latest PrintCut-windows-x64.zip --prerelease --target $env:GITHUB_SHA --title "最新构建 (main)" --notes "自动构建，提交 $env:GITHUB_SHA"
+          $notes = "自动构建，提交 $env:GITHUB_SHA，时间 $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC"
+          gh release view latest *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload latest PrintCut-windows-x64.zip --clobber
+            gh release edit latest --notes $notes
+          } else {
+            $global:LASTEXITCODE = 0
+            gh release create latest PrintCut-windows-x64.zip --prerelease --target $env:GITHUB_SHA --title "最新构建 (main)" --notes $notes
+          }
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')

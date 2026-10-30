@@ -62,6 +62,9 @@ class DesignTask:
     name: str
     image_url: str
     remaining_seconds: int
+    item_id: str = ""
+    origin_item_id: str = ""
+    origin_order_id: str = ""
 
     @property
     def key(self) -> str:
@@ -146,12 +149,40 @@ class HumbirdClient:
                     name=str(t.get("sku_name") or ""),
                     image_url=str(t.get("image_path") or ""),
                     remaining_seconds=_int(o.get("remaining_deadline_delivery_time")),
+                    item_id=str(item.get("id") or ""),
+                    origin_item_id=str(item.get("origin_item_id") or item.get("id") or ""),
+                    origin_order_id=str(o.get("origin_order_id") or o.get("id") or ""),
                 ))
         tasks.sort(key=lambda x: x.remaining_seconds)
         return tasks
 
     def match_sku(self, sku: str) -> dict:
         return self.request("PATCH", "/oc/v1/product_relation/matching", {"third_sku": sku})
+
+    def match_spec(self, sku: str, spu_id: str) -> dict:
+        """Step 2 of 关联商品: resolves the order's colour/size to a SKU of the chosen product's SPU."""
+        return self.request("PATCH", "/oc/v1/product_relation/matching", {"third_sku": sku, "spu_id": spu_id})
+
+    def library_products(self, log=None, page_size: int = 100) -> list[dict]:
+        """Every designed product in the 定制商品 library (what the 关联商品 dialog lists)."""
+        products: list[dict] = []
+        page = 1
+        while True:
+            data = self.request("POST", "/customize-product/v1/products/page", {
+                "page": page, "page_size": page_size, "product_list_sign": 1,
+                "from_type_list": [1, 3], "language": "en",
+            })
+            batch = data.get("list") or []
+            products.extend(batch)
+            total = int(data.get("total") or 0)
+            if log:
+                log(f"正在读取图库 {len(products)}/{total}…")
+            if not batch or len(products) >= total:
+                return products
+            page += 1
+
+    def bind_product(self, relation_id: str, payload: dict) -> None:
+        self.request("PATCH", f"/oc/v1/product_relation/{relation_id}", payload)
 
 
 def _int(value, default: int = 10**9) -> int:
