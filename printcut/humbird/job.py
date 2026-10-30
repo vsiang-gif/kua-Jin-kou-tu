@@ -196,6 +196,7 @@ def download_product_images(client: HumbirdClient, root: Path, log=print, stop=N
     log("正在拉取「待设计」订单…")
     tasks = client.design_tasks()
     rows: list[list[str]] = []
+    by_url: dict[str, str] = {}
     ok = failed = dup = 0
     for i, t in enumerate(tasks, 1):
         if stop is not None and stop():
@@ -209,10 +210,19 @@ def download_product_images(client: HumbirdClient, root: Path, log=print, stop=N
                 url = product_image_url(client, t)
                 if not url:
                     raise HumbirdError("订单里没有商品图")
-                suffix = Path(url.split("?")[0]).suffix or ".jpg"
+                clean_url = url.split("?")[0]
+                if clean_url in by_url:
+                    file_name, note = by_url[clean_url], "重复印花，未单独保存"
+                    dup += 1
+                    ok += 1
+                    rows.append([t.third_order_id, t.store_name, t.sku, t.spec, t.name, file_name, note])
+                    log(f"下载中 {i}/{len(tasks)}  {t.third_order_id}（重复，跳过）")
+                    continue
+                suffix = Path(clean_url).suffix or ".jpg"
                 tmp = download(url, tmp_dir / f"{t.key}{suffix}")
                 h = image_hash(tmp)
                 same = find_duplicate(h, seen)
+                by_url[clean_url] = same or tmp.name
                 if same is not None:
                     tmp.unlink(missing_ok=True)
                     file_name, note = same, "重复印花，未单独保存"
